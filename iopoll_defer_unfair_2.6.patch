@@ -1,0 +1,338 @@
+diff --git a/block/blk-iopoll.c b/block/blk-iopoll.c
+index 58916af..aedc06c 100644
+--- a/block/blk-iopoll.c
++++ b/block/blk-iopoll.c
+@@ -16,8 +16,11 @@
+ 
+ int blk_iopoll_enabled = 1;
+ EXPORT_SYMBOL(blk_iopoll_enabled);
++int blk_iopoll_defer_by = 0;
++EXPORT_SYMBOL(blk_iopoll_defer_by);
+ 
+ static unsigned int blk_iopoll_budget __read_mostly = 256;
++static unsigned int iopoll_watermark  __read_mostly = 1;
+ 
+ static DEFINE_PER_CPU(struct list_head, blk_cpu_iopoll);
+ 
+@@ -77,11 +80,37 @@ void blk_iopoll_complete(struct blk_iopoll *iopoll)
+ }
+ EXPORT_SYMBOL(blk_iopoll_complete);
+ 
++void raise_iopoll_softirq(void* info)
++{
++	raise_softirq(BLOCK_IOPOLL_SOFTIRQ);
++}
++EXPORT_SYMBOL(raise_iopoll_softirq);
++
++static enum hrtimer_restart iopoll_callback(struct hrtimer *timer)
++{
++	struct tasklet_hrtimer *ttimer = container_of(timer,
++						      struct tasklet_hrtimer,
++						      timer);
++	struct blk_iopoll *iop = container_of(ttimer, struct blk_iopoll,
++					      timer);
++
++	/* The softirq must be raised on the same CPU as it was
++	 * scheduled on (iop is a per-cpu data structure)
++	 */
++	smp_call_function_single(iop->raise_on_cpu,
++				 (void*)&raise_iopoll_softirq,
++				 NULL, 0);
++
++	return HRTIMER_NORESTART;
++}
++EXPORT_SYMBOL(iopoll_callback);
++
+ static void blk_iopoll_softirq(struct softirq_action *h)
+ {
+ 	struct list_head *list = &__get_cpu_var(blk_cpu_iopoll);
+-	int rearm = 0, budget = blk_iopoll_budget;
++	int rearm = 0, sched = 0, budget = blk_iopoll_budget;
+ 	unsigned long start_time = jiffies;
++	struct tasklet_hrtimer *softirq_timer;
+ 
+ 	local_irq_disable();
+ 
+@@ -106,6 +135,18 @@ static void blk_iopoll_softirq(struct softirq_action *h)
+ 		 */
+ 		iop = list_entry(list->next, struct blk_iopoll, list);
+ 
++		/* Defers this poll based on previous poll
++		 * result. Breaks out of loop; does not iterate over
++		 * all iop structures "fairly".
++		 */
++		if (iop->defer) {
++			softirq_timer = &iop->timer;
++			iop->defer = 0;
++			iop->raise_on_cpu = get_cpu();
++			sched = 1;
++			break;
++		}
++
+ 		weight = iop->weight;
+ 		work = 0;
+ 		if (test_bit(IOPOLL_F_SCHED, &iop->state))
+@@ -113,6 +154,14 @@ static void blk_iopoll_softirq(struct softirq_action *h)
+ 
+ 		budget -= work;
+ 
++		/* If not enough work was done on this poll, defer the
++		 * next poll attempt to coalesce more aggressively.
++		 */
++		if (blk_iopoll_defer_by != 0 &&
++		    work > 0 && work <= iopoll_watermark) {
++			iop->defer = 1;
++		}
++
+ 		local_irq_disable();
+ 
+ 		/*
+@@ -133,6 +182,13 @@ static void blk_iopoll_softirq(struct softirq_action *h)
+ 
+ 	if (rearm)
+ 		__raise_softirq_irqoff(BLOCK_IOPOLL_SOFTIRQ);
++	else if (sched) {
++		unsigned long usecs = blk_iopoll_defer_by * 1000;
++		if (hrtimer_start(&softirq_timer->timer,
++				  ktime_set(0, usecs),
++				  HRTIMER_MODE_REL))
++			printk("Timer already started\n");
++	}
+ 
+ 	local_irq_enable();
+ }
+@@ -183,6 +239,9 @@ void blk_iopoll_init(struct blk_iopoll *iop, int weight, blk_iopoll_fn *poll_fn)
+ {
+ 	memset(iop, 0, sizeof(*iop));
+ 	INIT_LIST_HEAD(&iop->list);
++	tasklet_hrtimer_init(&iop->timer, &iopoll_callback,
++			     CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	iop->defer = 0;
+ 	iop->weight = weight;
+ 	iop->poll = poll_fn;
+ 	set_bit(IOPOLL_F_SCHED, &iop->state);
+diff --git a/drivers/ata/ahci.c b/drivers/ata/ahci.c
+index 3288263..83e14dc 100644
+--- a/drivers/ata/ahci.c
++++ b/drivers/ata/ahci.c
+@@ -46,6 +46,7 @@
+ #include <scsi/scsi_host.h>
+ #include <scsi/scsi_cmnd.h>
+ #include <linux/libata.h>
++#include <linux/blk-iopoll.h>
+ #include "ahci.h"
+ 
+ #define DRV_NAME	"ahci"
+diff --git a/drivers/ata/libahci.c b/drivers/ata/libahci.c
+index ebc08d6..9b19999 100644
+--- a/drivers/ata/libahci.c
++++ b/drivers/ata/libahci.c
+@@ -56,6 +56,11 @@ MODULE_PARM_DESC(skip_host_reset, "skip global host reset (0=don't skip, 1=skip)
+ module_param_named(ignore_sss, ahci_ignore_sss, int, 0444);
+ MODULE_PARM_DESC(ignore_sss, "Ignore staggered spinup flag (0=don't ignore, 1=ignore)");
+ 
++
++static int iopoll_w = 8;
++module_param_named(iopoll_w, iopoll_w, int, 0444);
++MODULE_PARM_DESC(iopoll_w, "AHCI iopoll weight (NAPI)");
++
+ static int ahci_set_lpm(struct ata_link *link, enum ata_lpm_policy policy,
+ 			unsigned hints);
+ static ssize_t ahci_led_show(struct ata_port *ap, char *buf);
+@@ -1570,7 +1575,7 @@ static void ahci_error_intr(struct ata_port *ap, u32 irq_stat)
+ 		ata_port_abort(ap);
+ }
+ 
+-static void ahci_port_intr(struct ata_port *ap)
++static int ahci_port_intr(struct ata_port *ap)
+ {
+ 	void __iomem *port_mmio = ahci_port_base(ap);
+ 	struct ata_eh_info *ehi = &ap->link.eh_info;
+@@ -1595,7 +1600,7 @@ static void ahci_port_intr(struct ata_port *ap)
+ 
+ 	if (unlikely(status & PORT_IRQ_ERROR)) {
+ 		ahci_error_intr(ap, status);
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (status & PORT_IRQ_SDB_FIS) {
+@@ -1655,7 +1660,42 @@ static void ahci_port_intr(struct ata_port *ap)
+ 		ehi->err_mask |= AC_ERR_HSM;
+ 		ehi->action |= ATA_EH_RESET;
+ 		ata_port_freeze(ap);
++		rc = 0;
++	}
++	return rc;
++}
++
++static void ap_irq_disable(struct ata_port *ap)
++{
++	void __iomem *port_mmio = ahci_port_base(ap);
++
++	writel(0, port_mmio + PORT_IRQ_MASK);
++}
++
++static void ap_irq_enable(struct ata_port *ap)
++{
++	void __iomem *port_mmio = ahci_port_base(ap);
++	struct ahci_port_priv *pp = ap->private_data;
++
++	writel(pp->intr_mask, port_mmio + PORT_IRQ_MASK);
++}
++
++static int ahci_iopoll(struct blk_iopoll *iop, int budget)
++{
++	struct ata_port *ap = container_of(iop, struct ata_port, iopoll);
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&ap->host->lock, flags);
++	ret = ahci_port_intr(ap);
++	spin_unlock_irqrestore(&ap->host->lock, flags);
++
++	if (ret < budget) {
++		blk_iopoll_complete(iop);
++		ap_irq_enable(ap);
+ 	}
++
++	return ret;
+ }
+ 
+ irqreturn_t ahci_interrupt(int irq, void *dev_instance)
+@@ -1688,7 +1728,12 @@ irqreturn_t ahci_interrupt(int irq, void *dev_instance)
+ 
+ 		ap = host->ports[i];
+ 		if (ap) {
+-			ahci_port_intr(ap);
++			if (!blk_iopoll_enabled)
++				ahci_port_intr(ap);
++			else if (blk_iopoll_sched_prep(&ap->iopoll)) {
++				ap_irq_disable(ap);
++				blk_iopoll_sched(&ap->iopoll);
++			}
+ 			VPRINTK("port %u\n", i);
+ 		} else {
+ 			VPRINTK("port %u (no irq)\n", i);
+@@ -1928,6 +1973,7 @@ static int ahci_port_resume(struct ata_port *ap)
+ 	else
+ 		ahci_pmp_detach(ap);
+ 
++	blk_iopoll_enable(&ap->iopoll);
+ 	return 0;
+ }
+ 
+@@ -2026,7 +2072,9 @@ static int ahci_port_start(struct ata_port *ap)
+ 
+ 	ap->private_data = pp;
+ 
+-	/* engage engines, captain */
++	blk_iopoll_init(&ap->iopoll, iopoll_w, ahci_iopoll);
++
++        /* engage engines, captain */
+ 	return ahci_port_resume(ap);
+ }
+ 
+@@ -2039,6 +2087,8 @@ static void ahci_port_stop(struct ata_port *ap)
+ 	rc = ahci_deinit_port(ap, &emsg);
+ 	if (rc)
+ 		ata_port_printk(ap, KERN_WARNING, "%s (%d)\n", emsg, rc);
++
++	blk_iopoll_disable(&ap->iopoll);
+ }
+ 
+ void ahci_print_info(struct ata_host *host, const char *scc_s)
+diff --git a/drivers/staging/ath6kl/os/linux/include/athendpack_linux.h b/drivers/staging/ath6kl/os/linux/include/athendpack_linux.h
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/drivers/staging/ath6kl/os/linux/include/athstartpack_linux.h b/drivers/staging/ath6kl/os/linux/include/athstartpack_linux.h
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/include/linux/blk-iopoll.h b/include/linux/blk-iopoll.h
+index 308734d..825a714 100644
+--- a/include/linux/blk-iopoll.h
++++ b/include/linux/blk-iopoll.h
+@@ -6,10 +6,13 @@ typedef int (blk_iopoll_fn)(struct blk_iopoll *, int);
+ 
+ struct blk_iopoll {
+ 	struct list_head list;
++	struct tasklet_hrtimer timer;
+ 	unsigned long state;
+ 	unsigned long data;
+ 	int weight;
+ 	int max;
++	int defer;
++	int raise_on_cpu;
+ 	blk_iopoll_fn *poll;
+ };
+ 
+@@ -42,7 +45,9 @@ extern void blk_iopoll_complete(struct blk_iopoll *);
+ extern void __blk_iopoll_complete(struct blk_iopoll *);
+ extern void blk_iopoll_enable(struct blk_iopoll *);
+ extern void blk_iopoll_disable(struct blk_iopoll *);
++extern void raise_iopoll_softirq(void* info);
+ 
+ extern int blk_iopoll_enabled;
++extern int blk_iopoll_defer_by;
+ 
+ #endif
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index 15b77b8..c66ebe4 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -38,6 +38,7 @@
+ #include <linux/acpi.h>
+ #include <linux/cdrom.h>
+ #include <linux/sched.h>
++#include <linux/blk-iopoll.h>
+ 
+ /*
+  * Define if arch has non-standard setup.  This is a _PCI_ standard
+@@ -797,6 +798,7 @@ struct ata_port {
+ #endif
+ 	/* owned by EH */
+ 	u8			sector_buf[ATA_SECT_SIZE] ____cacheline_aligned;
++        struct blk_iopoll	iopoll;
+ };
+ 
+ /* The following initializer overrides a method to NULL whether one of
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index c33a1ed..21faaee 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -105,6 +105,7 @@ extern int sysctl_nr_trim_pages;
+ #endif
+ #ifdef CONFIG_BLOCK
+ extern int blk_iopoll_enabled;
++extern int blk_iopoll_defer_by;
+ #endif
+ 
+ /* Constants used for minimum and  maximum */
+@@ -953,6 +954,14 @@ static struct ctl_table kern_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++	{
++		.procname	= "blk_iopoll_defer_by",
++		.data		= &blk_iopoll_defer_by,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
++
+ #endif
+ /*
+  * NOTE: do not add new entries to this table unless you have read
+diff --git a/scripts/setlocalversion b/scripts/setlocalversion
+index ef8729f..231071a 100755
+--- a/scripts/setlocalversion
++++ b/scripts/setlocalversion
+@@ -52,7 +52,7 @@ scm_version()
+ 			# If only the short version is requested, don't bother
+ 			# running further git commands
+ 			if $short; then
+-				echo "+"
++				echo ""
+ 				return
+ 			fi
+ 			# If we are past a tagged commit (like

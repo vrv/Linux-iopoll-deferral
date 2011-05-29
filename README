@@ -1,0 +1,43 @@
+Deferred I/O polling for the Linux ATA driver
+Author: Vijay Vasudevan (vrv@cs.cmu.edu)
+
+This work is aimed at improving the interrupt mitigation techniques
+for modern flash devices. This patch is an experimental feature and is
+not fully general (see note below).
+
+It is targeted toward recent kernel versions (2.6.32+) because it
+relies on the blk-iopoll infrastructure. This patch combines the ahci
+blk-iopoll support patch (after its split into libahci) with the
+deferred polling modifications.  It patches and merges properly with
+Linux 2.6.36 to 2.6.39, and has been tested to run properly on 2.6.36.
+
+Notes:
+
+Our experience with this patch has shown significantly
+increased random IOPS rates when random I/O performance is CPU-bound,
+but this has slightly adverse impacts on sequential throughput.
+
+This modification works best for single drive configurations: the
+deferral of completion processing currently breaks out of the iopoll
+loop.  If there are multiple iopoll structures (multiple drives), then
+we should continue processing the other drives, especially if they
+have a low I/O rate or are latency-sensitive.
+
+
+Use:
+
+The following sysctl has been added to play around with the parameters
+of deferral. Requires kernel.blk_iopoll=1 to activate.
+
+sysctl -w kernel.blk_iopoll_defer_by=X
+
+  Defers the processing of an interrupt by X microseconds when the
+  previous interrupt completed only 1 command.
+
+
+TODOs:
+1) Make defer_by value adaptive based on I/O rate.
+2) Fix unfair polling by continuing instead of breaking.
+
+Please contact vrv@cs.cmu.edu if you have any questions about the patch.
+Pull requests encouraged!
