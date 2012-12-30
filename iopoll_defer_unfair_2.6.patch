@@ -242,12 +242,6 @@ index ebc08d6..9b19999 100644
  }
  
  void ahci_print_info(struct ata_host *host, const char *scc_s)
-diff --git a/drivers/staging/ath6kl/os/linux/include/athendpack_linux.h b/drivers/staging/ath6kl/os/linux/include/athendpack_linux.h
-deleted file mode 100644
-index e69de29..0000000
-diff --git a/drivers/staging/ath6kl/os/linux/include/athstartpack_linux.h b/drivers/staging/ath6kl/os/linux/include/athstartpack_linux.h
-deleted file mode 100644
-index e69de29..0000000
 diff --git a/include/linux/blk-iopoll.h b/include/linux/blk-iopoll.h
 index 308734d..825a714 100644
 --- a/include/linux/blk-iopoll.h
