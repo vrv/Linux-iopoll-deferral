@@ -317,16 +317,3 @@ index c33a1ed..21faaee 100644
  #endif
  /*
   * NOTE: do not add new entries to this table unless you have read
-diff --git a/scripts/setlocalversion b/scripts/setlocalversion
-index ef8729f..231071a 100755
---- a/scripts/setlocalversion
-+++ b/scripts/setlocalversion
-@@ -52,7 +52,7 @@ scm_version()
- 			# If only the short version is requested, don't bother
- 			# running further git commands
- 			if $short; then
--				echo "+"
-+				echo ""
- 				return
- 			fi
- 			# If we are past a tagged commit (like
